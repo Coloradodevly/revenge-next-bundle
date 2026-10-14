@@ -1,0 +1,77 @@
+name: Update Revenge bundle
+
+on:
+  schedule:
+    - cron: '0 */6 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pages: write
+
+env:
+  UPSTREAM: revenge-mod/revenge-bundle-next
+  ARTIFACT: revenge-bundle
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Find latest upstream build on main
+        id: find
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          json=$(gh api "repos/$UPSTREAM/actions/artifacts?name=$ARTIFACT&per_page=30")
+          row=$(echo "$json" | jq -c '[.artifacts[] | select(.expired == false and .workflow_run.head_branch == "main")][0]')
+          if [ "$row" = "null" ]; then
+            echo "::error::No non-expired build from main found upstream"
+            exit 1
+          fi
+          echo "id=$(echo "$row" | jq -r .id)" >> "$GITHUB_OUTPUT"
+          echo "sha=$(echo "$row" | jq -r .workflow_run.head_sha)" >> "$GITHUB_OUTPUT"
+
+      - name: Skip if already current
+        id: check
+        env:
+          SHA: ${{ steps.find.outputs.sha }}
+        run: |
+          if [ -f .upstream-sha ] && [ "$(cat .upstream-sha)" = "$SHA" ]; then
+            echo "Already on $SHA"
+            echo "current=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Download and replace bundle
+        if: steps.check.outputs.current != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ID: ${{ steps.find.outputs.id }}
+          SHA: ${{ steps.find.outputs.sha }}
+        run: |
+          set -euo pipefail
+          gh api "repos/$UPSTREAM/actions/artifacts/$ID/zip" > bundle.zip
+          mkdir out
+          unzip -q bundle.zip -d out
+          f=$(find out -type f -name 'revenge.bundle' | head -n1)
+          if [ -z "$f" ]; then
+            echo "::error::revenge.bundle not found in artifact. Contents:"
+            find out -type f
+            exit 1
+          fi
+          cp "$f" revenge.bundle
+          echo "$SHA" > .upstream-sha
+          rm -rf out bundle.zip
+          git config user.name 'github-actions[bot]'
+          git config user.email 'github-actions[bot]@users.noreply.github.com'
+          git add revenge.bundle .upstream-sha
+          git commit -m "Update Revenge Next bundle to ${SHA::7}"
+          git push
+
+      - name: Trigger Pages rebuild
+        if: steps.check.outputs.current != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh api -X POST "repos/${{ github.repository }}/pages/builds" || true
